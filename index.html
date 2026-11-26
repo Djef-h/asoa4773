@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="bg">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASOA IoT Dashboard & OTA</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+    .container { max-width: 900px; margin: auto; }
+    .card { background: #1e293b; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 15px; }
+    .metric { background: #334155; padding: 15px; border-radius: 8px; text-align: center; }
+    .metric h3 { margin: 0; font-size: 14px; color: #94a3b8; }
+    .metric p { margin: 8px 0 0; font-size: 24px; font-weight: bold; color: #38bdf8; }
+    #terminal { background: #000; color: #22c55e; font-family: monospace; height: 280px; overflow-y: auto; padding: 15px; border-radius: 8px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+    input, button { padding: 10px 15px; border-radius: 6px; border: none; font-size: 14px; }
+    input { background: #334155; color: white; margin-right: 10px; }
+    button { background: #3b82f6; color: white; cursor: pointer; font-weight: bold; }
+    button:hover { background: #2563eb; }
+    .hidden { display: none; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <!-- Екран за вход -->
+  <div id="login-box" class="card">
+    <h2>Вход в системата</h2>
+    <input type="email" id="email" placeholder="Имейл">
+    <input type="password" id="password" placeholder="Парола">
+    <button onclick="login()">Влез</button>
+    <p id="login-error" style="color: #ef4444;"></p>
+  </div>
+
+  <!-- Основен панел -->
+  <div id="dashboard" class="hidden">
+    <div class="header">
+      <h1>ASOA IoT Мониторинг <span id="role-badge" style="font-size: 14px; background: #334155; padding: 4px 10px; border-radius: 12px;"></span></h1>
+      <button onclick="logout()" style="background: #ef4444;">Изход</button>
+    </div>
+
+    <!-- Сензорни данни -->
+    <div class="card">
+      <h2>Последни измервания</h2>
+      <div class="grid">
+        <div class="metric"><h3>Вода Темп.</h3><p id="val-temp">-- °C</p></div>
+        <div class="metric"><h3>EC</h3><p id="val-ec">-- mS/cm</p></div>
+        <div class="metric"><h3>TDS</h3><p id="val-tds">-- PPT</p></div>
+        <div class="metric"><h3>Въздух Темп.</h3><p id="val-air-t">-- °C</p></div>
+        <div class="metric"><h3>Влажност</h3><p id="val-air-h">-- %</p></div>
+        <div class="metric"><h3>Версия / WiFi</h3><p id="val-ver">--</p></div>
+      </div>
+    </div>
+
+    <!-- АДМИН ПАНЕЛ (Скрит за обикновени потребители) -->
+    <div id="admin-panel" class="card hidden" style="border: 1px solid #f59e0b;">
+      <h2 style="color: #f59e0b; margin-top: 0;">Admin: Отдалечен OTA Ъпдейт (.bin)</h2>
+      <input type="file" id="bin-file" accept=".bin">
+      <button onclick="uploadFirmware()" style="background: #f59e0b; color: #000;">Качи и обнови ESP32</button>
+      <p id="ota-status" style="margin-top: 10px; font-weight: bold;"></p>
+    </div>
+
+    <!-- SERIAL TERMINAL НА ЖИВО -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+        <h2 style="margin: 0;">ESP32 Live Serial Terminal</h2>
+        <button onclick="document.getElementById('terminal').innerText = ''" style="background: #475569; padding: 5px 10px;">Изчисти</button>
+      </div>
+      <div id="terminal">Очакване на връзка с ESP32...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── ТВОИТЕ SUPABASE ДАННИ ──────────────────────────────
+  const SUPABASE_URL = 'https://loyevdyvjmndqgtjxjmh.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_vgSZZL_mrtKFXxfg-Qhd6Q_V97bjPgL'; // <--- СМЕНИ ТОВА С ТВОЯ sb_publishable_... КЛЮЧ!
+  // ──────────────────────────────────────────────────────
+
+  const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  async function login() {
+    const email = document.getElementById('email').value;
+    const password = document.getElementById('password').value;
+    const { error } = await sb.auth.signInWithPassword({ email, password });
+    if (error) {
+      document.getElementById('login-error').innerText = error.message;
+    } else {
+      initApp();
+    }
+  }
+
+  async function logout() {
+    await sb.auth.signOut();
+    location.reload();
+  }
+
+  async function initApp() {
+    const { data: { user } } = await sb.auth.getUser();
+    if (!user) return;
+
+    document.getElementById('login-box').classList.add('hidden');
+    document.getElementById('dashboard').classList.remove('hidden');
+
+    // Проверка на ролята (admin или user)
+    const { data: roleData } = await sb.from('user_roles').select('role').eq('user_id', user.id).single();
+    const role = roleData ? roleData.role : 'user';
+    document.getElementById('role-badge').innerText = role.toUpperCase();
+
+    if (role === 'admin') {
+      document.getElementById('admin-panel').classList.remove('hidden');
+    }
+
+    loadLatestData();
+    loadInitialLogs();
+    subscribeRealtime();
+  }
+
+  async function loadLatestData() {
+    const { data } = await sb.from('sensor_data').select('*').order('id', { ascending: false }).limit(1);
+    if (data && data.length > 0) updateMetricsUI(data[0]);
+  }
+
+  function updateMetricsUI(row) {
+    document.getElementById('val-temp').innerText = row.temp + ' °C';
+    document.getElementById('val-ec').innerText = row.ec + ' mS/cm';
+    document.getElementById('val-tds').innerText = row.tds + ' PPT';
+    document.getElementById('val-air-t').innerText = row.air_temp + ' °C';
+    document.getElementById('val-air-h').innerText = row.air_hum + ' %';
+    document.getElementById('val-ver').innerText = `v${row.ver} (${row.rssi}dBm)`;
+  }
+
+  async function loadInitialLogs() {
+    const term = document.getElementById('terminal');
+    const { data } = await sb.from('device_logs').select('*').order('id', { ascending: false }).limit(20);
+    if (data) {
+      term.innerText = data.reverse().map(l => `[${new Date(l.created_at).toLocaleTimeString()}]\n${l.message}`).join('\n') + '\n';
+      term.scrollTop = term.scrollHeight;
+    }
+  }
+
+  function subscribeRealtime() {
+    const term = document.getElementById('terminal');
+    
+    // Слушане за нови логове на живо
+    sb.channel('logs-channel')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'device_logs' }, payload => {
+        const time = new Date(payload.new.created_at).toLocaleTimeString();
+        term.innerText += `[${time}]\n${payload.new.message}\n`;
+        term.scrollTop = term.scrollHeight;
+      }).subscribe();
+
+    // Слушане за нови сензорни данни на живо
+    sb.channel('sensor-channel')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_data' }, payload => {
+        updateMetricsUI(payload.new);
+      }).subscribe();
+  }
+
+  // Качване на .bin файл и стартиране на OTA (Само за Admin)
+  async function uploadFirmware() {
+    const fileInput = document.getElementById('bin-file');
+    const status = document.getElementById('ota-status');
+    if (!fileInput.files.length) return alert('Избери .bin файл!');
+
+    const file = fileInput.files[0];
+    const fileName = `fw_${Date.now()}.bin`;
+    status.innerText = 'Качване на файла в сървъра...';
+
+    // 1. Качване в Supabase Storage
+    const { error: uploadError } = await sb.storage.from('firmware').upload(fileName, file);
+    if (uploadError) {
+      status.innerText = 'Грешка при качване: ' + uploadError.message;
+      return;
+    }
+
+    // 2. Взимане на публичния URL на файла
+    const { data: urlData } = sb.storage.from('firmware').getPublicUrl(fileName);
+
+    // 3. Подаване на команда към ESP32 в таблицата device_control
+    const { error: dbError } = await sb.from('device_control')
+      .update({ trigger_ota: true, firmware_url: urlData.publicUrl })
+      .eq('device_id', 'esp32_main');
+
+    if (dbError) {
+      status.innerText = 'Грешка при командата: ' + dbError.message;
+    } else {
+      status.innerText = 'Файлът е качен! ESP32 ще се обнови до 1 минута (следи терминала долу).';
+    }
+  }
+
+  // Автоматичен вход, ако сесията е активна
+  initApp();
+</script>
+</body>
+</html>
