@@ -1,232 +1,3 @@
-//eBjCmoJ48A27PR6K // Superbase ASOA4773 password 
-//admin@asoa.bg =  V.4773
-/*
- * ASOA 
- Date:26.11.2026
- 
-#include <Arduino.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
-#include <Wire.h>
-#include <Adafruit_ADS1X15.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <esp_task_wdt.h> // Хардуерна библиотека за Watchdog пазача на ESP32
-
-#define WIFI_SSID   "LAB"
-#define WIFI_PASS   "Ropotamo24#"
-#define MQTT_HOST   "broker.hivemq.com"
-#define MQTT_PORT   1883
-#define MQTT_TOPIC  "archeoiot/abc123xyz"
-
-// ── Настройки за Сигурност и Рестарт ────────────────────
-#define WATCHDOG_TIMEOUT_SEC  10                      // Авариен таймаут: 10 секунди
-const unsigned long REBOOT_INTERVAL = 6 * 60 * 60 * 1000; // Профилактичен рестарт на всеки 6 часа (в ms)
-
-// ── Хардуерни Пинове за ESP32 ──────────────────────────
-#define ONE_WIRE_BUS 4     // DS18B20 температурен сензор на GPIO 4
-// ADS1115 използва стандартните хардуерни I2C пинове за ESP32: SDA (GPIO 21), SCL (GPIO 22)
-
-// ── Коефициенти и Константи ─────────────────────────────
-const unsigned long SEND_INTERVAL = 2000; // Интервал за пращане към БД (ms)
-const float CAL_SLOPE      = 6.3373;      // Измереният наклон (m)
-const float CAL_INTERCEPT  = 0.0711;      // Измереният офсет (b)
-const float TDS_COEF       = 0.6400;      // Стандарт 442 за природни води
-
-// ── Обекти ────────────────────────────────────────────
-Adafruit_ADS1115 ads;
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature tempSensor(&oneWire);
-WiFiClient espClient;
-PubSubClient mqtt(espClient);
-
-// ── Глобални променливи за данните ─────────────────────
-float lastTemp = 25.0f;
-float lastEC   = 0.0f; 
-float lastTDS  = 0.0f; 
-int   lastWL   = 85;   // Заложена статична стойност за Dashboard-а
-
-// Task Handle за Watchdog задачата на второто ядро
-TaskHandle_t WatchdogTaskHandle = NULL;
-
-// ── Прототипи на функциите (Задължително за PlatformIO) ──
-void handleMQTT();
-void readSensors();
-void sendDataToDatabase();
-void checkScheduledReset();
-void watchdogTask(void * pvParameters);
-
-// ── Настройка (Setup) ──────────────────────────────────
-void setup() {
-  Serial.begin(115200);
-
-  // Стартиране на I2C шината
-  Wire.begin();
-
-  // Инициализация на АЦП ADS1115
-  if (!ads.begin()) {
-    Serial.println("Критична грешка: ADS1115 не е намерен на I2C шината!");
-    while (1);
-  }
-  ads.setGain(GAIN_FOUR); // Обхват до +/- 1.024V (31.25 uV на единица)
-
-  // Старт на температурния сензор
-  tempSensor.begin();
-
-  // Свързване към Wi-Fi мрежата
-  Serial.print("\nСвързване към Wi-Fi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi Свързан! IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\nWi-Fi Грешка - уредът преминава в автономен режим");
-  }
-
-  // Настройка на MQTT параметрите
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setKeepAlive(60);
-
-  // ── СТАРТИРАНЕ НА ХАРДУЕРНИЯ WATCHDOG НА ЯДРО 0 (CORE 0) ──
-  xTaskCreatePinnedToCore(
-    watchdogTask,            // Функция на задачата
-    "WatchdogTask",          // Текстово име
-    4000,                    // Размер на стека
-    NULL,                    // Входящи параметри
-    1,                       // Приоритет
-    &WatchdogTaskHandle,     // Указател към задачата
-    0                        // ИНСТРУКЦИЯ: Изпълнявай само на Ядро 0
-  );
-
-  Serial.println("Watchdog системата е активирана успешно на Core 0!");
-}
-
-// ── Главен Цикъл (Върти се на Ядро 1 по подразбиране) ──
-void loop() {
-  // 1. Проверка за профилактичен 6-часов рестарт на паметта
-  checkScheduledReset();
-
-  // 2. Поддържане на MQTT мрежовия трафик жив
-  handleMQTT();
-
-  // 3. Измерване и изпращане в зададения времеви прозорец
-  static unsigned long lastSend = 0;
-  if (millis() - lastSend >= SEND_INTERVAL) {
-    lastSend = millis();
-
-    // Извикване на измерванията
-    readSensors();
-
-    // Локален дебъг в терминала на PlatformIO
-    Serial.printf("Лог -> Т: %.1f °C | EC: %.3f mS/cm | TDS: %.2f PPT\n", lastTemp, lastEC, lastTDS);
-
-    // Изпращане на данните в JSON формат
-    sendDataToDatabase();
-  }
-}
-
-// ── ЗАДАЧА ЗА ЯДРО 0: СЛЕДЕНЕ ЗА ЗАБИВАНЕ (WATCHDOG) ────
-void watchdogTask(void * pvParameters) {
-  // Активиране на Task Watchdog Timer за ядрото
-  esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true); // true = хардуерен рестарт при забиване
-  esp_task_wdt_add(NULL);                         // Закачане на текущата нишка
-
-  for(;;) {
-    // Редовно "храним" кучето на всеки 1 секунда
-    esp_task_wdt_reset();
-    
-    // Предаваме контрола обратно на FreeRTOS за 1 секунда (неблокираща пауза)
-    vTaskDelay(1000 / portTICK_PERIOD_MS); 
-  }
-}
-
-// ── ФУНКЦИЯ ЗА АВТОМАТИЧНО ИЗЧИСТВАНЕ НА RAM ПАМЕТТА ─────
-void checkScheduledReset() {
-  // Проверка дали времето на непрекъсната работа е надхвърлило 6 часа
-  if (millis() >= REBOOT_INTERVAL) {
-    Serial.println("🚨 Изпълнява се планиран 6-часов рестарт за превантивно изчистване на паметта!");
-    delay(500);    // Изчакване за изпращане на серийния лог
-    ESP.restart(); // Софтуерно-хардуерен рестарт на целия микроконтролер
-  }
-}
-
-// ── МРЕЖОВИ И ИЗМЕРВАТЕЛНИ ФУНКЦИИ ───────────────────────
-
-void handleMQTT() {
-  if (mqtt.connected()) {
-    mqtt.loop();
-    return;
-  }
-  
-  static unsigned long lastMqttAttempt = 0;
-  if (millis() - lastMqttAttempt < 5000) return;
-  lastMqttAttempt = millis();
-
-  Serial.print("Опит за MQTT връзка...");
-  
-  // Създаване на уникално MQTT ID на база хардуерния MAC адрес
-  uint64_t chipid = ESP.getEfuseMac();
-  String clientId = "ESP32_Archeo_" + String((uint32_t)(chipid >> 32), HEX);
-  
-  if (mqtt.connect(clientId.c_str())) {
-    Serial.println(" Успешно свързване!");
-  } else {
-    Serial.printf(" Грешка: %d\n", mqtt.state());
-  }
-}
-
-void readSensors() {
-  // 1. Четене на температурата от цифровия сензор DS18B20
-  tempSensor.requestTemperatures();
-  float currentTemp = tempSensor.getTempCByIndex(0);
-  if (currentTemp != DEVICE_DISCONNECTED_C && currentTemp > -40.0f) {
-    lastTemp = currentTemp;
-  }
-
-  // 2. Четене на суровото напрежение от високопрецизния ADS1115 (Канал A0)
-  int16_t adcResults = ads.readADC_SingleEnded(0);
-  float voltageRaw = adcResults * 0.00003125; 
-
-  // 3. Температурна компенсация, приведена към 25°C
-  float temperatureCoefficient = 1.0f + 0.0185f * (lastTemp - 25.0f);
-  float compensatedVoltage = voltageRaw / temperatureCoefficient;
-
-  // 4. Математическо изчисляване на EC на базата на двете тествани точки
-  if (voltageRaw > 0.005f) { // Софтуерен филтър за работа във въздушна среда
-    lastEC = (CAL_SLOPE * compensatedVoltage) + CAL_INTERCEPT;
-    if (lastEC < 0.0f) lastEC = 0.0f;
-  } else {
-    lastEC = 0.0f; 
-  }
-
-  // 5. Точна формула за превръщане в PPT за нуждите на ASOA терминала
-  // Вече изпращаме директно реалната стойност (напр. 1.36 mS/cm * 0.64 = 0.87 PPT)
-  lastTDS = lastEC * TDS_COEF;
-}
-
-void sendDataToDatabase() {
-  if (!mqtt.connected()) return;
-
-  // Инициализиране на JSON пакета
-  StaticJsonDocument<128> doc;
-  doc["temp"] = round(lastTemp * 10)  / 10.0;
-  doc["ec"]   = round(lastEC   * 100) / 100.0; 
-  doc["tds"]  = round(lastTDS  * 100) / 100.0; // Изпраща се като чисто PPT (напр. 0.87)
-  doc["wl"]   = lastWL;                       
-
-  String json;
-  serializeJson(doc, json);
-  mqtt.publish(MQTT_TOPIC, json.c_str());
-}
-*/
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -239,25 +10,37 @@ void sendDataToDatabase() {
 #include <DallasTemperature.h>
 #include <DHT.h>
 #include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 
 // ── Версия и ID на устройството ────────────────────────
-#define FW_VERSION  "3.1.0"
+#define FW_VERSION  "3.3.0"
 #define DEVICE_ID   "esp32_main"
 
-// ── Wi-Fi Настройки ────────────────────────────────────
-#define WIFI_SSID   "DESKTOP-C1PKIL4 2200"
-#define WIFI_PASS   "H3[h6610"
+// ── Списък с Wi-Fi Мрежи (по приоритет) ────────────────
+struct WiFiNetwork {
+  const char* ssid;
+  const char* password;
+};
+
+const WiFiNetwork WIFI_NETWORKS[] = {
+  { "DESKTOP-C1PKIL4 2200", "H3[h6610" },
+  { "LAB",                  "Ropotamo24#" }
+  // Добави още мрежи тук при нужда:
+  // { "ImeNaMreja", "Parola" }
+};
+const int WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
 // ── Supabase Настройки ─────────────────────────────────
 const char* SUPABASE_URL = "https://loyevdyvjmndqgtjxjmh.supabase.co";
-const char* SUPABASE_KEY = "sb_publishable_vgSZZL_mrtKFXxfg-Qhd6Q_V97bjPgL"; // <--- СМЕНИ ТОВА С ТВОЯ sb_publishable_... КЛЮЧ!
+const char* SUPABASE_KEY = "sb_publishable_vgSZZL_mrtKFXxfg-Qhd6Q_V97bjPgL";
 
 // ── Интервали и Сигурност ──────────────────────────────
 #define WATCHDOG_TIMEOUT_SEC  25
 const unsigned long SENSOR_INTERVAL = 2000;   // Четене и LCD: на всеки 2 сек
 const unsigned long LOG_INTERVAL    = 3000;   // Пращане на терминал логове: на 3 сек
-const unsigned long SEND_INTERVAL   = 60000;  // Пращане на данни и проверка за OTA: на 1 минута
+unsigned long sendInterval          = 60000;  // Динамичен интервал за БД/OTA (по подразбиране 60 сек)
 const unsigned long REBOOT_INTERVAL = 6UL * 60UL * 60UL * 1000UL; // Профилактичен рестарт на 6 часа
 
 // ── Хардуерни Пинове ───────────────────────────────────
@@ -266,10 +49,26 @@ const unsigned long REBOOT_INTERVAL = 6UL * 60UL * 60UL * 1000UL; // Профи�
 #define DHTTYPE      DHT11
 // I2C пинове за ADS1115 и LCD 16x2: SDA = GPIO 21, SCL = GPIO 22
 
-// ── Калибрация на EC / TDS ─────────────────────────────
-const float CAL_SLOPE     = 6.3373;
-const float CAL_INTERCEPT = 0.0711;
-const float TDS_COEF      = 0.6400;
+// ── Динамична Калибрация на EC / TDS (зарежда се от паметта / Supabase) ──
+float calSlope     = 6.3373f;
+float calIntercept = 0.0711f;
+float tdsCoef      = 0.6400f;
+
+// ── Офлайн буфер в RAM при липса на Wi-Fi (до 120 записа) ──
+#define MAX_OFFLINE_RECORDS 120
+struct SensorRecord {
+  float temp;
+  float air_temp;
+  float air_hum;
+  float ec;
+  float tds;
+  int   wl;
+  int   rssi;
+  unsigned long uptime_sec;
+  uint32_t free_heap;
+};
+SensorRecord offlineBuffer[MAX_OFFLINE_RECORDS];
+int offlineCount = 0;
 
 // ── Обекти ─────────────────────────────────────────────
 Adafruit_ADS1115 ads;
@@ -279,6 +78,7 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature tempSensor(&oneWire);
 DHT dht(DHTPIN, DHTTYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+Preferences prefs;
 
 // ── Глобални променливи за данните ─────────────────────
 float lastWaterTemp = 25.0f;
@@ -287,6 +87,7 @@ float lastAirHum    = 0.0f;
 float lastEC        = 0.0f;
 float lastTDS       = 0.0f;
 int   lastWL        = 85;
+String bootResetReason = "Unknown";
 
 // Буфер за отдалечения уеб терминал
 String logBuffer = "";
@@ -299,14 +100,38 @@ void webLog(String msg) {
   }
 }
 
+// Помощна функция за изписване на точно 16 символа на ред на LCD (без премигване)
+void printLcdLine(uint8_t row, const char* text) {
+  char line[17];
+  snprintf(line, sizeof(line), "%-16.16s", text);
+  lcd.setCursor(0, row);
+  lcd.print(line);
+}
+
+// Определяне на причината за последния рестарт
+String getResetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "Power On (Tok)";
+    case ESP_RST_SW:        return "Software / OTA / Remote";
+    case ESP_RST_PANIC:     return "Crash / Exception";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:       return "Watchdog Reset";
+    case ESP_RST_BROWNOUT:  return "Brownout (Nisko naprezhenie)";
+    default:                return "Other (" + String((int)esp_reset_reason()) + ")";
+  }
+}
+
 // ── Прототипи ──────────────────────────────────────────
-void setupWiFi();
+bool connectToKnownWiFi();
 void checkWiFi();
 void readSensors();
 void updateLCD();
 void flushLogsToSupabase();
-void sendDataToSupabase();
-void checkRemoteOTA();
+void handleDataSync();
+bool postSingleRecord(const SensorRecord& rec, int bufLeft);
+void flushOfflineBuffer();
+void checkRemoteControl();
 void performOTAUpdate(String binUrl);
 void checkScheduledReset();
 
@@ -314,13 +139,19 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
 
+  bootResetReason = getResetReasonText();
+
+  // Зареждане на запазените калибрационни коефициенти от енергонезависимата памет
+  prefs.begin("asoa_cal", false);
+  calSlope     = prefs.getFloat("slope", 6.3373f);
+  calIntercept = prefs.getFloat("intercept", 0.0711f);
+  tdsCoef      = prefs.getFloat("tds_coef", 0.6400f);
+
   // Старт на LCD дисплея
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("ASOA IoT v" FW_VERSION);
-  lcd.setCursor(0, 1);
-  lcd.print("Startirane...");
+  printLcdLine(0, "ASOA IoT v" FW_VERSION);
+  printLcdLine(1, "Startirane...");
 
   // Инициализация на ADS1115
   if (ads.begin()) {
@@ -329,8 +160,7 @@ void setup() {
     webLog("[INIT] ADS1115 OK");
   } else {
     webLog("[ERROR] ADS1115 ne e nameren na I2C!");
-    lcd.setCursor(0, 1);
-    lcd.print("Greshka ADS1115!");
+    printLcdLine(1, "Greshka ADS1115!");
     delay(2000);
   }
 
@@ -340,9 +170,12 @@ void setup() {
   tempSensor.requestTemperatures();
   dht.begin();
 
-  // Свързване към Wi-Fi
-  setupWiFi();
-  webLog("[SYS] Ustroystvoto startira. Ver: " FW_VERSION);
+  // Свързване към някоя от зададените Wi-Fi мрежи
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  connectToKnownWiFi();
+
+  webLog("[SYS] Start v" FW_VERSION " | Reset: " + bootResetReason + " | Slope: " + String(calSlope, 4));
 
   // Активиране на Watchdog за главния loop()
   esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
@@ -374,39 +207,65 @@ void loop() {
     flushLogsToSupabase();
   }
 
-  // 3. Запис на данните в базата и проверка за OTA ъпдейт (на 1 минута)
+  // 3. Запис на данните (или в офлайн буфера) и проверка за OTA / настройки
   static unsigned long lastCloudSync = 0;
-  if (millis() - lastCloudSync >= SEND_INTERVAL) {
+  if (millis() - lastCloudSync >= sendInterval) {
     lastCloudSync = millis();
-    sendDataToSupabase();
-    checkRemoteOTA();
+    handleDataSync();
+    checkRemoteControl();
   }
 }
 
-void setupWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+bool connectToKnownWiFi() {
+  for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
+    // Превантивно нулиране на Watchdog при опит за връзка в loop()
+    if (esp_task_wdt_status(NULL) == ESP_OK) {
+      esp_task_wdt_reset();
+    }
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-    delay(250);
+    String currentSsid = String(WIFI_NETWORKS[i].ssid);
+    webLog("[WIFI] Opit za svarzvane kam: " + currentSsid);
+
+    printLcdLine(0, "Wi-Fi Tyrsene...");
+    printLcdLine(1, currentSsid.c_str());
+
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(WIFI_NETWORKS[i].ssid, WIFI_NETWORKS[i].password);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
+      delay(250);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      webLog("[WIFI] Svarzan kam: " + WiFi.SSID() +
+             " | IP: " + WiFi.localIP().toString() +
+             " | Signal: " + String(WiFi.RSSI()) + " dBm");
+
+      printLcdLine(0, "Wi-Fi Svarzan!");
+      printLcdLine(1, WiFi.SSID().c_str());
+      delay(1200);
+      return true;
+    } else {
+      webLog("[WIFI] Neuspeshno kam: " + currentSsid);
+    }
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    webLog("[WIFI] Svarzan! IP: " + WiFi.localIP().toString());
-  } else {
-    webLog("[WIFI] Nyama vrazka - avtonomen rejim.");
-  }
+  webLog("[WIFI] Nyama vrazka s nito edna mreja - aktiviran offline bufer.");
+  printLcdLine(0, "Wi-Fi: Nyama");
+  printLcdLine(1, "Offline rejim");
+  delay(1200);
+  return false;
 }
 
 void checkWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastRetry = 0;
-    if (millis() - lastRetry > 15000) {
+    if (millis() - lastRetry > 20000) {
       lastRetry = millis();
-      WiFi.disconnect();
-      WiFi.reconnect();
+      webLog("[WIFI] Zagubena vrazka! Tyrsene na nalichna mreja...");
+      connectToKnownWiFi();
     }
   }
 }
@@ -434,9 +293,70 @@ void flushLogsToSupabase() {
   http.end();
 }
 
-void sendDataToSupabase() {
-  if (WiFi.status() != WL_CONNECTED) return;
+void handleDataSync() {
+  SensorRecord currentRec = {
+    roundf(lastWaterTemp * 10) / 10.0f,
+    roundf(lastAirTemp   * 10) / 10.0f,
+    roundf(lastAirHum    * 10) / 10.0f,
+    roundf(lastEC        * 100) / 100.0f,
+    roundf(lastTDS       * 100) / 100.0f,
+    lastWL,
+    WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100,
+    millis() / 1000UL,
+    ESP.getFreeHeap()
+  };
 
+  if (WiFi.status() == WL_CONNECTED) {
+    // Ако има натрупани офлайн записи, първо изпращаме тях
+    if (offlineCount > 0) {
+      flushOfflineBuffer();
+    }
+    // Изпращаме текущия запис
+    if (postSingleRecord(currentRec, offlineCount)) {
+      webLog("[DB] Dannite sa zapisani v Supabase.");
+    } else {
+      webLog("[DB ERROR] Neuspeshen zapis - premestvane v bufera.");
+      if (offlineCount < MAX_OFFLINE_RECORDS) {
+        offlineBuffer[offlineCount++] = currentRec;
+      }
+    }
+  } else {
+    // Няма интернет -> пазим в RAM буфера
+    if (offlineCount < MAX_OFFLINE_RECORDS) {
+      offlineBuffer[offlineCount++] = currentRec;
+      Serial.printf("[BUF] Offline zapis #%d v RAM.\n", offlineCount);
+    } else {
+      // Изместваме най-стария запис при препълване
+      for (int i = 1; i < MAX_OFFLINE_RECORDS; i++) {
+        offlineBuffer[i - 1] = offlineBuffer[i];
+      }
+      offlineBuffer[MAX_OFFLINE_RECORDS - 1] = currentRec;
+    }
+  }
+}
+
+void flushOfflineBuffer() {
+  webLog("[BUF] Vazstanovena vrazka! Izprashtane na " + String(offlineCount) + " offline zapisa...");
+  int sent = 0;
+  for (int i = 0; i < offlineCount; i++) {
+    esp_task_wdt_reset();
+    if (postSingleRecord(offlineBuffer[i], offlineCount - i - 1)) {
+      sent++;
+      delay(80);
+    } else {
+      break;
+    }
+  }
+  if (sent > 0) {
+    for (int i = sent; i < offlineCount; i++) {
+      offlineBuffer[i - sent] = offlineBuffer[i];
+    }
+    offlineCount -= sent;
+    webLog("[BUF] Uspeshno kacheni " + String(sent) + " zapisa.");
+  }
+}
+
+bool postSingleRecord(const SensorRecord& rec, int bufLeft) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -446,48 +366,92 @@ void sendDataToSupabase() {
   http.addHeader("apikey", SUPABASE_KEY);
   http.addHeader("Prefer", "return=minimal");
 
-  StaticJsonDocument<256> doc;
-  doc["temp"]     = round(lastWaterTemp * 10) / 10.0;
-  doc["air_temp"] = round(lastAirTemp   * 10) / 10.0;
-  doc["air_hum"]  = round(lastAirHum    * 10) / 10.0;
-  doc["ec"]       = round(lastEC        * 100) / 100.0;
-  doc["tds"]      = round(lastTDS       * 100) / 100.0;
-  doc["wl"]       = lastWL;
-  doc["rssi"]     = WiFi.RSSI();
-  doc["ver"]      = FW_VERSION;
+  StaticJsonDocument<420> doc;
+  doc["temp"]           = rec.temp;
+  doc["air_temp"]       = rec.air_temp;
+  doc["air_hum"]        = rec.air_hum;
+  doc["ec"]             = rec.ec;
+  doc["tds"]            = rec.tds;
+  doc["wl"]             = rec.wl;
+  doc["rssi"]           = rec.rssi;
+  doc["ver"]            = FW_VERSION;
+  doc["uptime_sec"]     = rec.uptime_sec;
+  doc["free_heap"]      = rec.free_heap;
+  doc["reset_reason"]   = bootResetReason;
+  doc["buffered_count"] = bufLeft;
 
   String payload;
   serializeJson(doc, payload);
   int code = http.POST(payload);
-  if (code == 201 || code == 200) {
-    webLog("[DB] Dannite sa zapisani v Supabase (1 min).");
-  } else {
-    webLog("[DB ERROR] Kod: " + String(code));
-  }
   http.end();
+  return (code == 201 || code == 200);
 }
 
-void checkRemoteOTA() {
+void checkRemoteControl() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
 
-  String url = String(SUPABASE_URL) + "/rest/v1/device_control?device_id=eq." + DEVICE_ID + "&select=trigger_ota,firmware_url";
+  String url = String(SUPABASE_URL) + "/rest/v1/device_control?device_id=eq." + DEVICE_ID + "&select=*";
   http.begin(client, url);
   http.addHeader("apikey", SUPABASE_KEY);
 
   if (http.GET() == 200) {
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<1024> doc;
     if (!deserializeJson(doc, http.getString()) && doc.size() > 0) {
-      bool triggerOta = doc[0]["trigger_ota"];
-      String binUrl = doc[0]["firmware_url"].as<String>();
+      bool triggerOta    = doc[0]["trigger_ota"] | false;
+      bool triggerReboot = doc[0]["trigger_reboot"] | false;
+      int newInterval    = doc[0]["send_interval_sec"] | 60;
+      String binUrl      = doc[0]["firmware_url"].as<String>();
 
+      // Проверка за нови калибрационни коефициенти от Admin панела
+      float newSlope     = doc[0]["cal_slope"] | calSlope;
+      float newIntercept = doc[0]["cal_intercept"] | calIntercept;
+      float newTdsCoef   = doc[0]["tds_coef"] | tdsCoef;
+
+      if (fabs(newSlope - calSlope) > 0.0001f ||
+          fabs(newIntercept - calIntercept) > 0.0001f ||
+          fabs(newTdsCoef - tdsCoef) > 0.0001f) {
+        calSlope     = newSlope;
+        calIntercept = newIntercept;
+        tdsCoef      = newTdsCoef;
+
+        prefs.putFloat("slope", calSlope);
+        prefs.putFloat("intercept", calIntercept);
+        prefs.putFloat("tds_coef", tdsCoef);
+
+        webLog("[CAL] Obnovena kalibracia: Slope=" + String(calSlope, 4) +
+               " Offset=" + String(calIntercept, 4) + " TDS=" + String(tdsCoef, 4));
+      }
+
+      // Актуализиране на интервала на изпращане
+      if (newInterval >= 5 && newInterval <= 3600) {
+        sendInterval = (unsigned long)newInterval * 1000UL;
+      }
+
+      // Отдалечен рестарт от Admin панела
+      if (triggerReboot) {
+        http.end();
+
+        HTTPClient patchHttp;
+        patchHttp.begin(client, String(SUPABASE_URL) + "/rest/v1/device_control?device_id=eq." + DEVICE_ID);
+        patchHttp.addHeader("Content-Type", "application/json");
+        patchHttp.addHeader("apikey", SUPABASE_KEY);
+        patchHttp.PATCH("{\"trigger_reboot\": false}");
+        patchHttp.end();
+
+        webLog("[SYS] Poluchena komanda za otdalechen restart!");
+        flushLogsToSupabase();
+        delay(500);
+        ESP.restart();
+      }
+
+      // Отдалечен OTA ъпдейт
       if (triggerOta && binUrl.length() > 10) {
         http.end();
 
-        // Нулираме флага trigger_ota на false преди да започнем ъпдейта
         HTTPClient patchHttp;
         patchHttp.begin(client, String(SUPABASE_URL) + "/rest/v1/device_control?device_id=eq." + DEVICE_ID);
         patchHttp.addHeader("Content-Type", "application/json");
@@ -507,11 +471,8 @@ void performOTAUpdate(String binUrl) {
   webLog("[OTA] Zapochna izteglyane na nov firmware...");
   flushLogsToSupabase();
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("OTA Update...");
-  lcd.setCursor(0, 1);
-  lcd.print("Izteglyane...");
+  printLcdLine(0, "OTA Update...");
+  printLcdLine(1, "Izteglyane...");
 
   esp_task_wdt_delete(NULL);
 
@@ -523,8 +484,7 @@ void performOTAUpdate(String binUrl) {
   t_httpUpdate_return ret = httpUpdate.update(client, binUrl);
   if (ret == HTTP_UPDATE_FAILED) {
     webLog("[OTA ERROR] " + httpUpdate.getLastErrorString());
-    lcd.setCursor(0, 1);
-    lcd.print("OTA Greshka!    ");
+    printLcdLine(1, "OTA Greshka!");
     delay(3000);
     esp_task_wdt_add(NULL);
   }
@@ -546,7 +506,7 @@ void readSensors() {
     lastAirTemp = t;
   }
 
-  // ADS1115 (EC / TDS с усредняване)
+  // ADS1115 (EC / TDS с усредняване и динамична калибрация)
   if (!adsAvailable) {
     if (ads.begin()) {
       ads.setGain(GAIN_FOUR);
@@ -564,24 +524,31 @@ void readSensors() {
   float voltageRaw = (adcSum / 10.0f) * 0.00003125f;
   float compV = voltageRaw / (1.0f + 0.0185f * (lastWaterTemp - 25.0f));
 
-  lastEC = (voltageRaw > 0.005f) ? max(0.0f, (CAL_SLOPE * compV) + CAL_INTERCEPT) : 0.0f;
-  lastTDS = lastEC * TDS_COEF;
+  lastEC = (voltageRaw > 0.005f) ? max(0.0f, (calSlope * compV) + calIntercept) : 0.0f;
+  lastTDS = lastEC * tdsCoef;
 }
 
 void updateLCD() {
   static bool scr = true;
-  lcd.clear();
+  char line0[17];
+  char line1[17];
+
   if (scr) {
-    lcd.setCursor(0, 0);
-    lcd.printf("W:%.1fC EC:%.2f", lastWaterTemp, lastEC);
-    lcd.setCursor(0, 1);
-    lcd.printf("TDS:%.2f PPT", lastTDS);
+    // Екран 1: Температура на водата, EC и TDS
+    snprintf(line0, sizeof(line0), "Voda:%4.1fC EC:%4.2f", lastWaterTemp, lastEC);
+    snprintf(line1, sizeof(line1), "TDS: %5.2f PPT", lastTDS);
   } else {
-    lcd.setCursor(0, 0);
-    lcd.printf("Air:%.1fC H:%d%%", lastAirTemp, (int)lastAirHum);
-    lcd.setCursor(0, 1);
-    lcd.print(WiFi.status() == WL_CONNECTED ? "Cloud OK" : "Offline");
+    // Екран 2: Въздух (темп. и влажност) + статус на мрежата
+    snprintf(line0, sizeof(line0), "Vazd:%4.1fC Vl:%2d%%", lastAirTemp, (int)lastAirHum);
+    if (WiFi.status() == WL_CONNECTED) {
+      snprintf(line1, sizeof(line1), "WiFi:%-11.11s", WiFi.SSID().c_str());
+    } else {
+      snprintf(line1, sizeof(line1), "Offline Buf:%d", offlineCount);
+    }
   }
+
+  printLcdLine(0, line0);
+  printLcdLine(1, line1);
   scr = !scr;
 }
 
